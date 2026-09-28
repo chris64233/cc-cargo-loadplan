@@ -40,14 +40,26 @@ public class LoadPlanController {
         return loadPlanService.confirm(planNo);
     }
 
-    /** 整组调整：重新分舱/加入/卸载，成功才生效，失败原配载不变。 */
+    /**
+     * 准备临时卸货/替换调整：对调整后的整份方案重新校验并生成新版本（PROPOSED），
+     * 不改变货物与舱位占用。校验失败返回 422，原配载不变。
+     */
     @PostMapping("/plans/{planNo}/adjust")
     public PlanResponse adjust(@PathVariable String planNo,
                                @Valid @RequestBody AdjustPlanRequest req) {
         return loadPlanService.adjust(planNo, req);
     }
 
-    /** 整组卸载：释放方案全部货物，方案取消。仅航班关闭前可用。 */
+    /**
+     * 确认调整：同一事务内切换全部货物与舱位占用，新版本生效、原版本保留为历史。
+     * 替换货物不可用或快照失效时整体回滚（409），原配载继续有效。
+     */
+    @PostMapping("/plans/{planNo}/adjust/confirm")
+    public PlanResponse confirmAdjustment(@PathVariable String planNo) {
+        return loadPlanService.confirmAdjustment(planNo);
+    }
+
+    /** 整组卸载：释放方案全部货物，方案取消。仅航班关闭前可用；重复请求幂等。 */
     @PostMapping("/plans/{planNo}/unload")
     public PlanResponse unload(@PathVariable String planNo) {
         return loadPlanService.unloadPlan(planNo);

@@ -45,6 +45,13 @@ public class LoadPlan {
     @OneToMany(mappedBy = "plan", cascade = CascadeType.ALL, orphanRemoval = true)
     private List<PlanAssignment> assignments = new ArrayList<>();
 
+    /**
+     * 历次配载版本明细（首次确认 = 版本 1，之后每次临时卸货/替换调整追加新版本）。
+     * 被取代的版本同样保留，用于还原任意时点的装机方案。
+     */
+    @OneToMany(mappedBy = "plan", cascade = CascadeType.ALL, orphanRemoval = true)
+    private List<PlanVersion> versions = new ArrayList<>();
+
     protected LoadPlan() {
     }
 
@@ -57,6 +64,33 @@ public class LoadPlan {
     public void addAssignment(PlanAssignment assignment) {
         assignment.setPlan(this);
         this.assignments.add(assignment);
+    }
+
+    public void addVersion(PlanVersion version) {
+        this.versions.add(version);
+    }
+
+    /** 下一个版本序号（首次确认为版本 1）。 */
+    public int nextVersionNo() {
+        return versions.size() + 1;
+    }
+
+    /** 当前生效（ACTIVE）版本；尚未确认或已整组卸载时为空。 */
+    public java.util.Optional<PlanVersion> activeVersion() {
+        return versions.stream()
+                .filter(v -> v.getStatus() == PlanVersionStatus.ACTIVE)
+                .findFirst();
+    }
+
+    /** 待确认（PROPOSED）的调整候选版本，同一时刻至多一个。 */
+    public java.util.Optional<PlanVersion> proposedVersion() {
+        return versions.stream()
+                .filter(v -> v.getStatus() == PlanVersionStatus.PROPOSED)
+                .findFirst();
+    }
+
+    public List<PlanVersion> getVersions() {
+        return versions;
     }
 
     public Long getId() {
