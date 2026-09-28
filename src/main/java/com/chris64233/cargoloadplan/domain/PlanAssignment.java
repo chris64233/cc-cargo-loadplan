@@ -9,7 +9,7 @@ import jakarta.persistence.Id;
 import jakarta.persistence.JoinColumn;
 import jakarta.persistence.ManyToOne;
 
-/** 方案内的一条装载安排：货物单元 → 货舱，并记录准备时的货物版本快照。 */
+/** 配载版本内的一条装载安排：货物单元 → 货舱，并记录准备时的货物版本快照。 */
 @Entity
 public class PlanAssignment {
 
@@ -18,8 +18,8 @@ public class PlanAssignment {
     private Long id;
 
     @ManyToOne(optional = false, fetch = FetchType.LAZY)
-    @JoinColumn(name = "plan_id")
-    private LoadPlan plan;
+    @JoinColumn(name = "plan_version_id")
+    private PlanVersion planVersion;
 
     @Column(nullable = false)
     private String unitNo;
@@ -27,15 +27,15 @@ public class PlanAssignment {
     @Column(nullable = false)
     private String holdCode;
 
-    /** 准备方案时货物单元的版本快照 */
+    /** 准备该版本时货物单元的版本快照 */
     @Column(nullable = false)
     private long unitVersionSnapshot;
 
     protected PlanAssignment() {
     }
 
-    public PlanAssignment(LoadPlan plan, String unitNo, String holdCode, long unitVersionSnapshot) {
-        this.plan = plan;
+    public PlanAssignment(PlanVersion planVersion, String unitNo, String holdCode, long unitVersionSnapshot) {
+        this.planVersion = planVersion;
         this.unitNo = unitNo;
         this.holdCode = holdCode;
         this.unitVersionSnapshot = unitVersionSnapshot;
@@ -45,12 +45,12 @@ public class PlanAssignment {
         return id;
     }
 
-    public LoadPlan getPlan() {
-        return plan;
+    public PlanVersion getPlanVersion() {
+        return planVersion;
     }
 
-    void setPlan(LoadPlan plan) {
-        this.plan = plan;
+    void setPlanVersion(PlanVersion planVersion) {
+        this.planVersion = planVersion;
     }
 
     public String getUnitNo() {

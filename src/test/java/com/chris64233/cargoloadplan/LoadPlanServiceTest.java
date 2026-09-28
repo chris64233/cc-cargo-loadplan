@@ -8,6 +8,7 @@ import com.chris64233.cargoloadplan.dto.CreatePlanRequest;
 import com.chris64233.cargoloadplan.dto.HoldRequest;
 import com.chris64233.cargoloadplan.dto.HoldUsageResponse;
 import com.chris64233.cargoloadplan.dto.PlanResponse;
+import com.chris64233.cargoloadplan.dto.PlanVersionResponse;
 import com.chris64233.cargoloadplan.dto.RecordUnloadRequest;
 import com.chris64233.cargoloadplan.dto.RegisterCargoRequest;
 import com.chris64233.cargoloadplan.dto.UpdateFlightConfigRequest;
@@ -82,6 +83,15 @@ class LoadPlanServiceTest {
         return newUnit(weight, "GEN", Set.of());
     }
 
+    private AdjustPlanRequest adjust(String changeNo, List<AssignmentRequest> moves, List<String> unload) {
+        return new AdjustPlanRequest(changeNo, moves, unload);
+    }
+
+    private void createAndConfirm(String flight, String planNo, List<AssignmentRequest> assignments) {
+        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo, assignments));
+        loadPlanService.confirm(planNo);
+    }
+
     // ---------- 方案号幂等 ----------
 
     @Test
@@ -98,6 +108,7 @@ class LoadPlanServiceTest {
         assertEquals("DRAFT", first.status());
         assertEquals(first.planNo(), second.planNo());
         assertEquals(first.assignments(), second.assignments());
+        assertEquals(1, first.currentVersionNo());
     }
 
     @Test
@@ -108,10 +119,11 @@ class LoadPlanServiceTest {
         loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
                 List.of(new AssignmentRequest(u1, "FWD"))));
 
-        PlanResponse first = loadPlanService.confirm(planNo);
-        PlanResponse second = loadPlanService.confirm(planNo);
+        PlanVersionResponse first = loadPlanService.confirm(planNo);
+        PlanVersionResponse second = loadPlanService.confirm(planNo);
 
         assertEquals("CONFIRMED", first.status());
+        assertEquals(1, first.versionNo());
         assertEquals("CONFIRMED", second.status());
     }
 
@@ -335,84 +347,443 @@ class LoadPlanServiceTest {
         };
     }
 
-    // ---------- 整组调整与卸载（航班关闭前） ----------
+    // ====================== 临时卸货 / 替换货物：版本化调整（本次新增） ======================
 
+    /** 1、调整形成新版本，准备阶段不触碰实际占用，并按整份方案重新核算。 */
     @Test
-    void adjustReassignsHoldsAtomically() {
-        String flight = newFlight(10000, 150);
-        String u1 = newUnit(100);
-        String u2 = newUnit(100);
-        String planNo = id("P");
-        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
-                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT"))));
-        loadPlanService.confirm(planNo);
-
-        PlanResponse adjusted = loadPlanService.adjust(planNo,
-                new AdjustPlanRequest(List.of(new AssignmentRequest(u2, "FWD")), List.of()));
-
-        assertEquals("CONFIRMED", adjusted.status());
-        assertEquals("FWD", cargoService.getUnit(u2).holdCode());
-        assertTrue(adjusted.assignments().contains(new AssignmentRequest(u2, "FWD")));
-    }
-
-    @Test
-    void failedAdjustLeavesOriginalLoadUntouched() {
-        // AFT 上限 150：把两件 100kg 货物都调去 AFT 必然失败
-        String flight = newFlight(10000, 150);
-        String u1 = newUnit(100);
-        String u2 = newUnit(100);
-        String planNo = id("P");
-        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
-                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT"))));
-        loadPlanService.confirm(planNo);
-
-        assertThrows(LoadConstraintException.class, () -> loadPlanService.adjust(planNo,
-                new AdjustPlanRequest(List.of(new AssignmentRequest(u1, "AFT"),
-                        new AssignmentRequest(u2, "AFT")), List.of())));
-
-        // 原配载不变
-        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
-        assertEquals("AFT", cargoService.getUnit(u2).holdCode());
-        assertEquals("LOCKED", cargoService.getUnit(u1).status());
-        assertEquals("LOCKED", cargoService.getUnit(u2).status());
-        PlanResponse plan = loadPlanService.getPlan(planNo);
-        assertTrue(plan.assignments().contains(new AssignmentRequest(u1, "FWD")));
-        assertTrue(plan.assignments().contains(new AssignmentRequest(u2, "AFT")));
-    }
-
-    @Test
-    void adjustCanUnloadAndAddUnits() {
+    void prepareAdjustCreatesDraftVersionWithoutTouchingLoad() {
         String flight = newFlight();
         String u1 = newUnit(100);
         String u2 = newUnit(100);
         String planNo = id("P");
-        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
-                List.of(new AssignmentRequest(u1, "FWD"))));
-        loadPlanService.confirm(planNo);
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT")));
 
-        PlanResponse adjusted = loadPlanService.adjust(planNo,
-                new AdjustPlanRequest(List.of(new AssignmentRequest(u2, "AFT")), List.of(u1)));
+        // 把 u2 从 AFT 调到 FWD，形成 v2 草案（CG (10000+500+500)/1200=9.17 在区间内）
+        PlanVersionResponse v2 = loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u2, "FWD")), List.of()));
 
+        assertEquals(2, v2.versionNo());
+        assertEquals("C1", v2.changeNo());
+        assertEquals("DRAFT", v2.status());
+        assertEquals(2, v2.assignments().size());
+        assertTrue(v2.assignments().contains(new AssignmentRequest(u2, "FWD")));
+
+        // 实际占用尚未切换：u2 仍在 AFT
+        assertEquals("AFT", cargoService.getUnit(u2).holdCode());
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+        // 当前生效版本仍是 v1
+        PlanResponse plan = loadPlanService.getPlan(planNo);
+        assertEquals(1, plan.currentVersionNo());
+        assertEquals("CONFIRMED", plan.status());
+        List<PlanVersionResponse> all = loadPlanService.listVersions(planNo);
+        assertEquals(2, all.size());
+        assertEquals("CONFIRMED", all.get(0).status());
+        assertEquals("DRAFT", all.get(1).status());
+    }
+
+    /** 1、按整份方案重新核算：加入替换货物导致超舱时准备即拒绝，不产生新版本，原方案不变。 */
+    @Test
+    void prepareAdjustRevalidatesWholePlaneAndRejectsViolation() {
+        String flight = newFlight(150, 10000); // FWD 上限 150
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        assertThrows(LoadConstraintException.class, () -> loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u2, "FWD")), List.of())));
+
+        // 新版本未落库，原方案与占用不变
+        assertEquals(1, loadPlanService.listVersions(planNo).size());
+        assertEquals("AVAILABLE", cargoService.getUnit(u2).status());
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+    }
+
+    /** 1、整份方案重算重心：卸货+替换后整机重心必须重新落入区间，否则准备即拒绝。 */
+    @Test
+    void prepareAdjustRecomputesCenterOfGravity() {
+        String flight = newFlight();
+        String a = newUnit(500);
+        String b = newUnit(500);
+        String planNo = id("P");
+        // FWD/AFT 各一件 500kg，CG=10
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(a, "FWD"), new AssignmentRequest(b, "AFT")));
+
+        // 卸下 AFT 平衡货物 b，并加入 1500kg 替换货物到 FWD：
+        // 前舱合计 2000kg，CG=(1000*10+2000*5)/3000=6.67 < 8，整份方案重心越界
+        String heavy = newUnit(1500);
+        LoadConstraintException ex = assertThrows(LoadConstraintException.class,
+                () -> loadPlanService.prepareAdjust(planNo,
+                        adjust("C1", List.of(new AssignmentRequest(heavy, "FWD")), List.of(b))));
+        assertTrue(ex.getViolations().stream().anyMatch(v -> v.contains("重心")));
+        // 调整未落库，原配载不变
+        assertEquals(1, loadPlanService.listVersions(planNo).size());
+        assertEquals("LOCKED", cargoService.getUnit(b).status());
+        assertEquals("AFT", cargoService.getUnit(b).holdCode());
+    }
+
+    /** 2、确认时同一事务切换全部货物与舱位：卸下 u1 释放，加入替换 u3 锁定并占舱。 */
+    @Test
+    void confirmAdjustSwitchesAllOccupancyAtomically() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String u3 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT")));
+
+        loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u3, "FWD")), List.of(u1)));
+        PlanVersionResponse confirmed = loadPlanService.confirm(planNo);
+
+        assertEquals("CONFIRMED", confirmed.status());
+        assertEquals(2, confirmed.versionNo());
+        assertEquals(List.of(u1), confirmed.unloadedUnitNos());
+        assertEquals(List.of(u3), confirmed.addedUnitNos());
+
+        // 卸下货物只释放一次：u1 回到空闲
         assertEquals("AVAILABLE", cargoService.getUnit(u1).status());
         assertNull(cargoService.getUnit(u1).planNo());
+        assertNull(cargoService.getUnit(u1).holdCode());
+        // 替换货物锁定到本方案 FWD
+        assertEquals("LOCKED", cargoService.getUnit(u3).status());
+        assertEquals("FWD", cargoService.getUnit(u3).holdCode());
+        assertEquals(planNo, cargoService.getUnit(u3).planNo());
+        // 在机货物 u2 保持
         assertEquals("LOCKED", cargoService.getUnit(u2).status());
-        assertEquals(planNo, cargoService.getUnit(u2).planNo());
-        assertEquals(List.of(new AssignmentRequest(u2, "AFT")), adjusted.assignments());
+
+        // 版本切换：v1 被取代，v2 为当前
+        List<PlanVersionResponse> all = loadPlanService.listVersions(planNo);
+        assertEquals("SUPERSEDED", all.get(0).status());
+        assertEquals("CONFIRMED", all.get(1).status());
+        assertEquals(2, loadPlanService.getPlan(planNo).currentVersionNo());
+
+        // 约束与舱位用量反映最终装机方案
+        ConstraintReportResponse report = flightService.constraints(flight);
+        assertTrue(report.withinEnvelope());
+        HoldUsageResponse fwd = flightService.holdUsage(flight).stream()
+                .filter(h -> h.holdCode().equals("FWD")).findFirst().orElseThrow();
+        assertEquals(100, fwd.usedWeight());
+        assertEquals(List.of(u3), fwd.loadedUnits());
     }
 
+    /** 2、替换货物在确认时不可用：整体回滚，原已确认配载继续有效。 */
     @Test
-    void unloadPlanReleasesAllUnits() {
+    void unavailableReplacementAtConfirmKeepsOriginalLoad() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String planNo = id("P");
+        String otherPlan = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+        createAndConfirm(flight, otherPlan, List.of(new AssignmentRequest(u2, "AFT")));
+
+        // planNo 想把 u2 作为替换货物加入：准备时 u2 已被 otherPlan 占用 → 准备即拒绝
+        ConflictException prep = assertThrows(ConflictException.class,
+                () -> loadPlanService.prepareAdjust(planNo,
+                        adjust("C1", List.of(new AssignmentRequest(u2, "FWD")), List.of(u1))));
+        assertTrue(prep.getMessage().contains("替换货物"));
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+
+        // 另一情景：准备时替换货物空闲，确认前被别的方案抢走
+        String u3 = newUnit(100);
+        loadPlanService.prepareAdjust(planNo,
+                adjust("C2", List.of(new AssignmentRequest(u3, "FWD")), List.of(u1)));
+        String thief = id("P");
+        createAndConfirm(flight, thief, List.of(new AssignmentRequest(u3, "AFT")));
+
+        ConflictException confirm = assertThrows(ConflictException.class,
+                () -> loadPlanService.confirm(planNo));
+        assertTrue(confirm.getMessage().contains("已被其他方案占用"));
+        // 原配载继续有效：u1 仍锁在 FWD，当前版本仍是 v1
+        assertEquals("LOCKED", cargoService.getUnit(u1).status());
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+        assertEquals(planNo, cargoService.getUnit(u1).planNo());
+        assertEquals(1, loadPlanService.getPlan(planNo).currentVersionNo());
+        assertEquals("CONFIRMED", loadPlanService.listVersions(planNo).get(0).status());
+    }
+
+    /** 3、确认前替换货物被改重（货物版本变化）→ 快照失效，确认拒绝、原方案不变。 */
+    @Test
+    void confirmAdjustFailsWhenReplacementWeightChanged() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u2, "FWD")), List.of(u1)));
+        cargoService.updateWeight(u2, new UpdateWeightRequest(120));
+
+        ConflictException ex = assertThrows(ConflictException.class,
+                () -> loadPlanService.confirm(planNo));
+        assertTrue(ex.getMessage().contains("快照失效"));
+        assertEquals("LOCKED", cargoService.getUnit(u1).status());
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+        assertEquals(1, loadPlanService.getPlan(planNo).currentVersionNo());
+    }
+
+    /** 3、确认前航班配置变化（航班配置版本递增）→ 快照失效，确认拒绝、原方案不变。 */
+    @Test
+    void confirmAdjustFailsWhenFlightConfigChanged() {
         String flight = newFlight();
         String u1 = newUnit(100);
         String planNo = id("P");
-        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
-                List.of(new AssignmentRequest(u1, "FWD"))));
-        loadPlanService.confirm(planNo);
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u1, "AFT")), List.of()));
+        flightService.updateConfig(flight, new UpdateFlightConfigRequest(1000, 10, 8, 11,
+                List.of(new HoldRequest("FWD", 10000, 10000, 5, Set.of()),
+                        new HoldRequest("AFT", 10000, 10000, 15, Set.of()))));
+
+        ConflictException ex = assertThrows(ConflictException.class,
+                () -> loadPlanService.confirm(planNo));
+        assertTrue(ex.getMessage().contains("快照失效"));
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+    }
+
+    /** 3、航班起飞（关闭）后调整版本不可确认，卸下未发生，原配载有效。 */
+    @Test
+    void confirmAdjustRejectedAfterFlightClosed() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        // 卸下唯一货物后的空方案 CG=10 仍合法，可以准备
+        loadPlanService.prepareAdjust(planNo, adjust("C1", List.of(), List.of(u1)));
+        flightService.close(flight);
+
+        ConflictException ex = assertThrows(ConflictException.class,
+                () -> loadPlanService.confirm(planNo));
+        assertTrue(ex.getMessage().contains("已关闭"));
+        assertEquals("LOCKED", cargoService.getUnit(u1).status());
+        assertEquals("FWD", cargoService.getUnit(u1).holdCode());
+        assertEquals(1, loadPlanService.getPlan(planNo).currentVersionNo());
+    }
+
+    /** 3、关闭后不允许准备新的调整。 */
+    @Test
+    void prepareAdjustRejectedAfterFlightClosed() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+        flightService.close(flight);
+
+        assertThrows(ConflictException.class, () -> loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(), List.of(u1))));
+    }
+
+    /** 3、两个方案并发确认同一替换货物：航班行锁 + 货物占用只允许一个成功，败者原方案不变。 */
+    @Test
+    void concurrentAdjustConfirmOnSharedReplacementOnlyOneWins() throws Exception {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String u3 = newUnit(100);
+        String planA = id("P");
+        String planB = id("P");
+        createAndConfirm(flight, planA, List.of(new AssignmentRequest(u1, "FWD")));
+        createAndConfirm(flight, planB, List.of(new AssignmentRequest(u2, "AFT")));
+
+        // 两个调整都想加入同一空闲替换货物 u3（各自替换掉原货物）
+        loadPlanService.prepareAdjust(planA,
+                adjust("CA", List.of(new AssignmentRequest(u3, "FWD")), List.of(u1)));
+        loadPlanService.prepareAdjust(planB,
+                adjust("CB", List.of(new AssignmentRequest(u3, "AFT")), List.of(u2)));
+
+        var pool = Executors.newFixedThreadPool(2);
+        CountDownLatch gate = new CountDownLatch(1);
+        Callable<Boolean> taskA = () -> {
+            gate.await();
+            try {
+                loadPlanService.confirm(planA);
+                return true;
+            } catch (RuntimeException e) {
+                return false;
+            }
+        };
+        Callable<Boolean> taskB = () -> {
+            gate.await();
+            try {
+                loadPlanService.confirm(planB);
+                return true;
+            } catch (RuntimeException e) {
+                return false;
+            }
+        };
+        Future<Boolean> fA = pool.submit(taskA);
+        Future<Boolean> fB = pool.submit(taskB);
+        gate.countDown();
+        boolean aWon = fA.get(30, TimeUnit.SECONDS);
+        boolean bWon = fB.get(30, TimeUnit.SECONDS);
+        pool.shutdownNow();
+
+        assertEquals(1, (aWon ? 1 : 0) + (bWon ? 1 : 0));
+        // u3 恰好被一个方案锁定
+        WhereaboutsResponse w = cargoService.whereabouts(u3);
+        assertEquals("LOCKED", w.status());
+        assertTrue(w.planNo().equals(planA) || w.planNo().equals(planB));
+        // 败者的原货物仍锁定、当前版本仍为 v1
+        if (aWon) {
+            assertEquals("LOCKED", cargoService.getUnit(u2).status());
+            assertEquals(planB, cargoService.getUnit(u2).planNo());
+            assertEquals(1, loadPlanService.getPlan(planB).currentVersionNo());
+        } else {
+            assertEquals("LOCKED", cargoService.getUnit(u1).status());
+            assertEquals(planA, cargoService.getUnit(u1).planNo());
+            assertEquals(1, loadPlanService.getPlan(planA).currentVersionNo());
+        }
+    }
+
+    /** 4、变更号幂等：同一 changeNo 重复准备返回同一版本，不重复卸货/占用。 */
+    @Test
+    void prepareAdjustIsIdempotentByChangeNo() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        AdjustPlanRequest req = adjust("C1", List.of(new AssignmentRequest(u2, "AFT")), List.of(u1));
+        PlanVersionResponse first = loadPlanService.prepareAdjust(planNo, req);
+        PlanVersionResponse second = loadPlanService.prepareAdjust(planNo, req);
+
+        assertEquals(first.versionNo(), second.versionNo());
+        assertEquals(2, first.versionNo());
+        assertEquals(2, loadPlanService.listVersions(planNo).size());
+    }
+
+    /** 4、以新变更号提交时，上一待确认草案作废；已作废版本不可确认。 */
+    @Test
+    void newChangeNoCancelsPendingDraft() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        PlanVersionResponse c1 = loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u1, "AFT")), List.of()));
+        PlanVersionResponse c2 = loadPlanService.prepareAdjust(planNo,
+                adjust("C2", List.of(new AssignmentRequest(u1, "FWD")), List.of()));
+
+        assertEquals("CANCELLED", loadPlanService.getVersion(planNo, c1.versionNo()).status());
+        assertEquals("DRAFT", c2.status());
+        assertThrows(ConflictException.class,
+                () -> loadPlanService.confirmVersion(planNo, c1.versionNo()));
+
+        PlanVersionResponse confirmed = loadPlanService.confirmVersion(planNo, c2.versionNo());
+        assertEquals("CONFIRMED", confirmed.status());
+        assertEquals(3, confirmed.versionNo());
+    }
+
+    /** 4、确认幂等：重复确认同一已确认版本不再二次卸货，货物状态稳定。 */
+    @Test
+    void confirmAdjustIsIdempotentAndUnloadsOnce() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT")));
+
+        loadPlanService.prepareAdjust(planNo, adjust("C1", List.of(), List.of(u1)));
+        PlanVersionResponse first = loadPlanService.confirm(planNo);
+        PlanVersionResponse second = loadPlanService.confirm(planNo);
+
+        assertEquals("CONFIRMED", first.status());
+        assertEquals("CONFIRMED", second.status());
+        assertEquals(2, second.versionNo());
+        // u1 只释放一次，重复确认后仍是空闲（不会被重复操作或报错）
+        assertEquals("AVAILABLE", cargoService.getUnit(u1).status());
+        assertNull(cargoService.getUnit(u1).planNo());
+        // u2 仍锁定
+        assertEquals("LOCKED", cargoService.getUnit(u2).status());
+    }
+
+    /** 4、整组卸载幂等：货物只释放一次，重复请求返回同一取消结果。 */
+    @Test
+    void unloadPlanReleasesAllUnitsAndIsIdempotent() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
 
         PlanResponse cancelled = loadPlanService.unloadPlan(planNo);
-
         assertEquals("CANCELLED", cancelled.status());
         assertEquals("AVAILABLE", cargoService.getUnit(u1).status());
+
+        // 重复卸载：幂等返回，不抛错、不重复释放
+        PlanResponse again = loadPlanService.unloadPlan(planNo);
+        assertEquals("CANCELLED", again.status());
+        assertEquals("AVAILABLE", cargoService.getUnit(u1).status());
+        assertNull(cargoService.getUnit(u1).planNo());
+    }
+
+    /** 4、各配载版本明细完整保留，可逐版本追溯卸下/加入的货物。 */
+    @Test
+    void allVersionDetailsAreRetained() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String u2 = newUnit(100);
+        String u3 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT")));
+
+        loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u3, "FWD")), List.of(u1)));
+        loadPlanService.confirm(planNo);
+        loadPlanService.prepareAdjust(planNo, adjust("C2", List.of(), List.of(u2)));
+        loadPlanService.confirm(planNo);
+
+        List<PlanVersionResponse> all = loadPlanService.listVersions(planNo);
+        assertEquals(3, all.size());
+        assertEquals("SUPERSEDED", all.get(0).status());
+        assertEquals("SUPERSEDED", all.get(1).status());
+        assertEquals("CONFIRMED", all.get(2).status());
+
+        PlanVersionResponse v1 = loadPlanService.getVersion(planNo, 1);
+        assertEquals(2, v1.assignments().size());
+        assertTrue(v1.addedUnitNos().containsAll(List.of(u1, u2)));
+
+        PlanVersionResponse v2 = loadPlanService.getVersion(planNo, 2);
+        assertTrue(v2.assignments().contains(new AssignmentRequest(u2, "AFT")));
+        assertTrue(v2.assignments().contains(new AssignmentRequest(u3, "FWD")));
+        assertEquals(List.of(u1), v2.unloadedUnitNos());
+        assertEquals(List.of(u3), v2.addedUnitNos());
+
+        PlanVersionResponse v3 = loadPlanService.getVersion(planNo, 3);
+        assertEquals(List.of(new AssignmentRequest(u3, "FWD")), v3.assignments());
+        assertEquals(List.of(u2), v3.unloadedUnitNos());
+    }
+
+    /** 整组卸载后存在待确认草案：草案一并取消，且不能再通过指定版本确认复活方案。 */
+    @Test
+    void unloadWithPendingDraftCancelsDraftAndBlocksRevival() {
+        String flight = newFlight();
+        String u1 = newUnit(100);
+        String planNo = id("P");
+        createAndConfirm(flight, planNo, List.of(new AssignmentRequest(u1, "FWD")));
+
+        PlanVersionResponse draft = loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u1, "AFT")), List.of()));
+        assertEquals(2, draft.versionNo());
+
+        loadPlanService.unloadPlan(planNo);
+
+        assertEquals("CANCELLED", loadPlanService.getPlan(planNo).status());
+        assertEquals("CANCELLED", loadPlanService.getVersion(planNo, draft.versionNo()).status());
+        assertEquals("AVAILABLE", cargoService.getUnit(u1).status());
+
+        // 不能通过确认遗留草案把已卸载方案复活
+        assertThrows(ConflictException.class, () -> loadPlanService.confirmVersion(planNo, draft.versionNo()));
         assertThrows(ConflictException.class, () -> loadPlanService.confirm(planNo));
     }
 
@@ -429,8 +800,8 @@ class LoadPlanServiceTest {
         flightService.close(flight);
 
         // 关闭后方案不可修改
-        assertThrows(ConflictException.class, () -> loadPlanService.adjust(planNo,
-                new AdjustPlanRequest(List.of(new AssignmentRequest(u1, "AFT")), List.of())));
+        assertThrows(ConflictException.class, () -> loadPlanService.prepareAdjust(planNo,
+                adjust("C1", List.of(new AssignmentRequest(u1, "AFT")), List.of())));
         assertThrows(ConflictException.class, () -> loadPlanService.unloadPlan(planNo));
         assertThrows(ConflictException.class, () -> loadPlanService.createPlan(flight,
                 new CreatePlanRequest(id("P"), List.of(new AssignmentRequest(newUnit(50), "AFT")))));
@@ -485,9 +856,8 @@ class LoadPlanServiceTest {
         String u1 = newUnit(100);
         String u2 = newUnit(100);
         String planNo = id("P");
-        loadPlanService.createPlan(flight, new CreatePlanRequest(planNo,
-                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT"))));
-        loadPlanService.confirm(planNo);
+        createAndConfirm(flight, planNo,
+                List.of(new AssignmentRequest(u1, "FWD"), new AssignmentRequest(u2, "AFT")));
 
         ConstraintReportResponse report = flightService.constraints(flight);
         // (1000*10 + 100*5 + 100*15) / 1200 = 10
